@@ -1,14 +1,23 @@
+# Usa una base leggera ma completa
 FROM python:3.11-slim
 
-# FFmpeg + libass + font fallback (Noto)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg fontconfig fonts-noto-core fonts-noto-cjk && \
-    rm -rf /var/lib/apt/lists/*
+# Installa ffmpeg con libass e i font base
+RUN apt-get update && apt-get install -y \
+    ffmpeg \
+    fonts-dejavu-core \
+    fonts-freefont-ttf \
+    libass9 \
+    && rm -rf /var/lib/apt/lists/*
 
+# Crea la cartella di lavoro
 WORKDIR /app
-COPY app.py requirements.txt /app/
-RUN pip install -r requirements.txt
 
-ENV FFMPEG_BIN=ffmpeg
-# Railway userà $PORT automaticamente
-CMD ["bash", "-lc", "uvicorn app:app --host 0.0.0.0 --port ${PORT:-8080}"]
+# Copia i file del progetto
+COPY . .
+
+# Installa dipendenze Python
+RUN pip install --no-cache-dir fastapi uvicorn
+
+# Porta il server FastAPI
+EXPOSE 8000
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
