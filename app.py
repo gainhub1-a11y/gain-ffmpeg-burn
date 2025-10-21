@@ -23,7 +23,7 @@ def burn_ass(video_url: str, ass_url: str, crf: int = 18,
         dl(video_url, in_mp4)
         dl(ass_url,   in_ass)
 
-        vf = f"subtitles='{in_ass.replace(':','\\:').replace(\"'\",\"\\\\'\")}':fontsdir='{fonts}':shaping=complex"
+        vf = f"subtitles='{in_ass.replace(':','\\:').replace('\"','\\\\\"').replace(\"'\",\"\\\\'\")}':fontsdir='{fonts}':shaping=complex"
         if force_style:
             vf += f":force_style='{force_style.replace(\"'\",\"\\\\'\")}'"
 
