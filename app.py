@@ -7,6 +7,9 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, JSONResponse
 
 app = FastAPI()
+@app.get("/ping")
+def ping():
+    return {"ok": True}
 FFMPEG_BIN = os.environ.get("FFMPEG_BIN", "ffmpeg")
 
 # ---------- util ----------
