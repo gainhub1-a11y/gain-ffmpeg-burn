@@ -1,103 +1,91 @@
-# app.py — GAIN FFmpeg burn-in (.ASS karaoke)
-import os
-import tempfile
-import subprocess
-import time
-import urllib.request
-from urllib.error import HTTPError, URLError
+# app.py — GAIN FFmpeg burn-in (.ASS karaoke) — versione robusta
+import os, tempfile, subprocess, urllib.request, urllib.parse, shutil
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, JSONResponse
+from urllib.error import HTTPError
 
 app = FastAPI()
-
 FFMPEG_BIN = os.environ.get("FFMPEG_BIN", "ffmpeg")
-
-# ---------- util ----------
-def download_to(path: str, url: str, timeout: int = 300, tries: int = 3):
-    """
-    Scarica url -> path usando header 'browser-like', streaming e retry.
-    Ritorna HTTP 400 con il dettaglio reale se il server remoto fallisce.
-    """
-    last_err = None
-    for attempt in range(1, tries + 1):
-        try:
-            req = urllib.request.Request(
-                url,
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                                  "(KHTML, like Gecko) Chrome/125.0 Safari/537.36",
-                    "Accept": "*/*",
-                    "Connection": "close",
-                }
-            )
-            with urllib.request.urlopen(req, timeout=timeout) as resp, open(path, "wb") as f:
-                while True:
-                    chunk = resp.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    f.write(chunk)
-            return
-        except HTTPError as e:
-            try:
-                body = e.read(4096).decode("utf-8", errors="ignore")
-            except Exception:
-                body = ""
-            last_err = f"HTTP {e.code}: {e.reason} {body[:300]}"
-        except URLError as e:
-            last_err = f"URL error: {e.reason}"
-        except Exception as e:
-            last_err = f"{type(e).__name__}: {e}"
-
-        if attempt < tries:
-            time.sleep(1.5 * attempt)
-
-    raise HTTPException(status_code=400, detail=f"Download failed: {last_err}")
-
-def escape_for_ffmpeg_path(p: str) -> str:
-    """
-    Escapa il percorso file per il filtro FFmpeg `subtitles=`.
-    Regole minime: \  '  :  (i due punti rompono il filtergraph)
-    """
-    s = p.replace("\\", "\\\\")
-    s = s.replace("'", "\\'")
-    s = s.replace(":", "\\:")
-    return s
+ASS_WORKER = os.environ.get("ASS_WORKER", "https://gain-subtitles-worker.gainhub1.workers.dev/")
 
 # ---------- health ----------
 @app.get("/ping")
 def ping():
     return {"ok": True}
 
+# ---------- util ----------
+UA_HDRS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/118 Safari/537.36",
+    "Accept": "*/*"
+}
+
+def http_download(url: str, path: str):
+    req = urllib.request.Request(url, headers=UA_HDRS)
+    try:
+        with urllib.request.urlopen(req, timeout=180) as r, open(path, "wb") as f:
+            shutil.copyfileobj(r, f)
+    except HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode(errors="ignore")[:500]
+        except Exception:
+            pass
+        raise HTTPException(status_code=400,
+                            detail=f"Download failed: HTTP {e.code}. {body or e.reason}")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Download failed: {e}")
+
+def escape_for_ffmpeg_path(p: str) -> str:
+    s = p.replace("\\", "\\\\").replace("'", "\\'").replace(":", "\\:")
+    return s
+
 # ---------- main ----------
 @app.get("/burn-ass")
 def burn_ass(
-    video_url: str = Query(..., description="URL MP4/MOV di input"),
-    ass_url: str = Query(..., description="URL .ASS (karaoke)"),
+    video_url: str = Query(..., description="URL MP4/MOV di input (pubblico)"),
+    ass_url: str | None = Query(None, description="URL .ASS già pronto"),
+    vtt_url: str | None = Query(None, description="URL .VTT di HeyGen: il server genera lui l'ASS"),
     crf: int = Query(18, ge=0, le=40),
     preset: str = Query("veryfast"),
     force_style: str | None = Query(None, description="override stile ASS: es. FontName=Arial,Outline=2,MarginV=40")
 ):
-    """
-    Scarica video + .ass, brucia i sottotitoli con libass, restituisce MP4 ottimizzato per social.
-    """
+    if not ass_url and not vtt_url:
+        raise HTTPException(status_code=422, detail="Fornisci 'ass_url' oppure 'vtt_url'.")
+
+    # Se passa il VTT, costruiamo noi l'URL del Worker (parametri di default stile ‘instagram-friendly’)
+    if not ass_url and vtt_url:
+        worker_params = {
+            "vtt": vtt_url,
+            "font": "Arial",
+            "size": "18",
+            "bold": "1",
+            "primary": "#FFFFFF",
+            "back_alpha": "70",
+            "align": "2",
+            "margin_v": "180",
+            "karaoke": "word",
+        }
+        ass_url = f"{ASS_WORKER}?{urllib.parse.urlencode(worker_params, quote_via=urllib.parse.quote)}"
+
     with tempfile.TemporaryDirectory() as tmpdir:
-        in_mp4 = os.path.join(tmpdir, "in.mp4")
-        in_ass = os.path.join(tmpdir, "subs.ass")
+        in_mp4  = os.path.join(tmpdir, "in.mp4")
+        in_ass  = os.path.join(tmpdir, "subs.ass")
         out_mp4 = os.path.join(tmpdir, "out.mp4")
-        fontsdir = "/usr/share/fonts/truetype"  # Noto è installato nel Dockerfile
+        fontsdir = "/usr/share/fonts/truetype"  # Noto/DejaVu nel container
 
         # 1) download
-        download_to(in_mp4, video_url)
-        download_to(in_ass, ass_url)
+        http_download(video_url, in_mp4)
+        http_download(ass_url, in_ass)
 
-        # 2) filtro FFmpeg
+        # 2) filtro subtitles (libass)
         safe_path = escape_for_ffmpeg_path(in_ass)
         vf = f"subtitles='{safe_path}':fontsdir='{fontsdir}':shaping=complex"
         if force_style and force_style.strip():
             fs = force_style.replace("\\", "\\\\").replace("'", "\\'")
             vf += f":force_style='{fs}'"
 
-        # 3) esegue ffmpeg
+        # 3) ffmpeg
         cmd = [
             FFMPEG_BIN, "-y",
             "-i", in_mp4,
@@ -110,12 +98,8 @@ def burn_ass(
             "-movflags", "+faststart",
             out_mp4,
         ]
-
         try:
-            proc = subprocess.run(
-                cmd, check=True,
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE
-            )
+            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         except subprocess.CalledProcessError as e:
             err = e.stderr.decode(errors="ignore")[-2000:]
             raise HTTPException(status_code=500, detail=f"FFmpeg error:\n{err}")
@@ -128,5 +112,7 @@ def root():
     return JSONResponse({
         "service": "GAIN ffmpeg burn-ass",
         "endpoints": ["/ping", "/burn-ass"],
-        "params_burn_ass": ["video_url", "ass_url", "crf=18", "preset=veryfast", "force_style=<optional>"]
+        "params_burn_ass": [
+            "video_url", "ass_url (oppure vtt_url)", "crf=18", "preset=veryfast", "force_style=<optional>"
+        ]
     })
