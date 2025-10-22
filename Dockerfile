@@ -1,23 +1,27 @@
-# Usa una base leggera ma completa
+# ==== Base image ====
 FROM python:3.11-slim
 
-# Installa ffmpeg con libass e i font base
+# ==== Environment ====
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV FFMPEG_BIN=ffmpeg
+ENV FONTS_DIR=/usr/share/fonts/truetype
+
+# ==== System deps ====
 RUN apt-get update && apt-get install -y \
     ffmpeg \
+    fonts-noto \
     fonts-dejavu-core \
-    fonts-freefont-ttf \
-    libass9 \
-    && rm -rf /var/lib/apt/lists/*
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# Crea la cartella di lavoro
+# ==== Working dir ====
 WORKDIR /app
 
-# Copia i file del progetto
+# ==== Copy files ====
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
 COPY . .
 
-# Installa dipendenze Python
-RUN pip install --no-cache-dir fastapi uvicorn
-
-# Porta il server FastAPI
-EXPOSE 8000
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+# ==== Run app ====
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080"]
