@@ -1,184 +1,132 @@
-# app.py — GAIN: VTT -> ASS (karaoke) con lo stesso stile del tuo Worker + burn-in FFmpeg
+# app.py — GAIN: VTT -> ASS (karaoke) + burn-in con FFmpeg
 import os
-import re
 import tempfile
-import httpx
 import subprocess
-from datetime import timedelta
+import urllib.request
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, JSONResponse
 
 app = FastAPI()
-
 FFMPEG_BIN = os.environ.get("FFMPEG_BIN", "ffmpeg")
-FONTS_DIR  = os.environ.get("FONTS_DIR", "/usr/share/fonts/truetype")
 
-# -------------------- HTTP helpers --------------------
-UA = {"User-Agent": "Mozilla/5.0 (GAIN/ffmpeg-burn)", "Accept": "*/*"}
+# ---------------- utils ----------------
+def download_to(path: str, url: str):
+    try:
+        urllib.request.urlretrieve(url, path)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Download failed: {e}")
 
-async def http_get_text(url: str) -> str:
-    async with httpx.AsyncClient(follow_redirects=True, timeout=120.0) as client:
-        r = await client.get(url, headers=UA)
-        if r.status_code >= 400:
-            raise HTTPException(status_code=400,
-                                detail=f"Download failed: HTTP {r.status_code}: {r.text[:400]}")
-        return r.text
+def escape_for_ffmpeg_path(p: str) -> str:
+    # Escapa caratteri critici per il filtro subtitles
+    s = p.replace("\\", "\\\\")   # backslash
+    s = s.replace("'", "\\'")     # apice singolo
+    s = s.replace(":", "\\:")     # due punti (C:\, etc.)
+    return s
 
-async def http_get_file(url: str, path: str):
-    async with httpx.AsyncClient(follow_redirects=True, timeout=None) as client:
-        r = await client.get(url, headers=UA)
-        if r.status_code >= 400:
-            raise HTTPException(status_code=400,
-                                detail=f"Download failed: HTTP {r.status_code}: {r.text[:400]}")
-        with open(path, "wb") as f:
-            for chunk in r.iter_bytes():
-                f.write(chunk)
+def clamp(x, a, b): return max(a, min(b, x))
+def pad(n): return str(n).zfill(2)
 
-def esc_for_subtitles(p: str) -> str:
-    # escaping minimo per il filtro subtitles=
-    return p.replace("\\", "\\\\").replace("'", "\\'").replace(":", "\\:")
+def to_ms(ts: str) -> int:
+    # "mm:ss.mmm" o "hh:mm:ss.mmm" -> ms
+    a = ts.split(":")
+    if len(a) == 2:
+        m, s = a; sec, ms = s.split(".")
+        return int(m)*60000 + int(sec)*1000 + int(ms)
+    h, m, s = a; sec, ms = s.split(".")
+    return int(h)*3600000 + int(m)*60000 + int(sec)*1000 + int(ms)
 
-# -------------------- VTT parsing (come il Worker) --------------------
-def vtt_parse(txt: str):
-    lines = txt.replace("\r", "").split("\n")
-    cues = []
-    i = 0
-    while i < len(lines):
-        ln = lines[i]
-        if not ln or re.match(r"^[A-Za-z-]+:", ln):  # header/comment
-            i += 1
-            continue
-        if "-->" not in ln:
-            i += 1
-            continue
-        m = re.search(r"(\d+:\d{2}:\d{2}\.\d{3}|\d{1,2}:\d{2}\.\d{3})\s*-->\s*(\d+:\d{2}:\d{2}\.\d{3}|\d{1,2}:\d{2}\.\d{3})", ln)
-        if not m:
-            i += 1
-            continue
-        start = _to_ms(m.group(1))
-        end   = _to_ms(m.group(2))
-        i += 1
-        text_lines = []
-        while i < len(lines) and lines[i]:
-            text_lines.append(lines[i])
-            i += 1
-        text = " ".join(text_lines)
-        text = re.sub(r"</?[^>]+>", "", text)   # remove HTML
-        text = re.sub(r"\s+", " ", text).strip()
-        if end > start and text:
-            cues.append({"start": start, "end": end, "text": text})
-        i += 1
-    return cues
-
-def _to_ms(ts: str) -> int:
-    # mm:ss.mmm  OR  hh:mm:ss.mmm
-    parts = ts.split(":")
-    if len(parts) == 2:
-        m, s = parts
-        sec, ms = s.split(".")
-        return int(m) * 60000 + int(sec) * 1000 + int(ms)
-    else:
-        h, m, s = parts
-        sec, ms = s.split(".")
-        return int(h) * 3600000 + int(m) * 60000 + int(sec) * 1000 + int(ms)
-
-def _ms_to_ass(ms: int) -> str:
+def ms_to_ass(ms: int) -> str:
     cs = (ms // 10) % 100
     s  = (ms // 1000) % 60
     m  = (ms // 60000) % 60
     h  = (ms // 3600000)
-    return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
+    return f"{h}:{pad(m)}:{pad(s)}.{pad(cs)}"
 
-def _is_alnum(c: str) -> bool:
-    # conta lettere/numeri Unicode (approssimazione robusta)
-    return c.isalnum()
-
-# -------------------- Colori come il Worker --------------------
 def hex_to_ass(hex_color: str) -> str:
-    # "#RRGGBB" -> "&H00BBGGRR"
-    if not hex_color:
-        return "&H00FFFFFF"
-    m = re.match(r"^#?([0-9a-fA-F]{6})$", hex_color)
-    if not m:
-        return "&H00FFFFFF"
+    # "#RRGGBB" -> "&HBBGGRR" (alpha aggiunto a parte nello stile)
+    import re
+    m = re.match(r"^#?([0-9a-fA-F]{6})$", hex_color or "")
+    if not m: return "&H00FFFFFF"
     rr, gg, bb = m.group(1)[0:2], m.group(1)[2:4], m.group(1)[4:6]
-    return f"&H00{bb.upper()}{gg.upper()}{rr.upper()}"
+    return f"&H00{bb}{gg}{rr}"
 
 def ass_with_alpha(hex_color: str, alpha_pct: int) -> str:
-    a = max(0, min(100, alpha_pct))
-    aa = f"{round(255 * a / 100):02X}"  # 0=opaco, 100=trasparente
-    m = re.match(r"^#?([0-9a-fA-F]{6})$", hex_color or "") or re.match(r"$", "")
-    rgb = (m.group(1) if m else "000000").upper().ljust(6, "0")
-    rr, gg, bb = rgb[0:2], rgb[2:4], rgb[4:6]
+    # 0=opaco … 100=trasparente -> &HAA BB GG RR
+    import re
+    a = clamp(int(alpha_pct), 0, 100)
+    aa = f"{round(255*a/100):02X}"
+    m = re.match(r"^#?([0-9a-fA-F]{6})$", hex_color or "") or ["", "000000"]
+    rr, gg, bb = m[1][0:2], m[1][2:4], m[1][4:6]
     return f"&H{aa}{bb}{gg}{rr}"
 
-# -------------------- ASS header identico al Worker --------------------
-def ass_header(font: str, size: int, bold_flag: int, primary: str, secondary: str,
+# ------------- VTT -> cues -------------
+def parse_vtt(vtt_text: str):
+    lines = vtt_text.replace("\r", "").split("\n")
+    cues = []
+    i = 0
+    import re
+    while i < len(lines):
+        if not lines[i] or re.match(r"^[A-Za-z-]+:", lines[i]):  # header/commenti
+            i += 1; continue
+        if "-->" not in lines[i]:  # cue id opzionale
+            i += 1
+        if i >= len(lines): break
+        m = re.search(r"(\d+:\d{2}:\d{2}\.\d{3}|\d{1,2}:\d{2}\.\d{3})\s*-->\s*"
+                      r"(\d+:\d{2}:\d{2}\.\d{3}|\d{1,2}:\d{2}\.\d{3})", lines[i])
+        if not m:
+            i += 1; continue
+        start, end = to_ms(m.group(1)), to_ms(m.group(2))
+        i += 1
+        text_lines = []
+        while i < len(lines) and lines[i]:
+            text_lines.append(lines[i]); i += 1
+        text = " ".join(text_lines)
+        # rimuovi HTML, normalizza spazi/line-break
+        text = re.sub(r"</?[^>]+>", "", text).replace("\\N", " ").replace("\n", " ")
+        text = re.sub(r"\s+", " ", text).strip()
+        if end > start and text:
+            cues.append({"start": start, "end": end, "text": text})
+        i += 1  # skip blank
+    return cues
+
+def to_ass_dialogue(cue, karaoke_mode: str):
+    start = ms_to_ass(cue["start"])
+    end   = ms_to_ass(cue["end"])
+    text  = cue["text"].replace("\\N", " ").replace("\n", " ")
+
+    if karaoke_mode != "off":
+        total_cs = max(1, round((cue["end"] - cue["start"]) / 10))
+        words = [w for w in text.split() if w]
+        if karaoke_mode == "word" and words:
+            import re
+            weights = [max(1, len(re.sub(r"[^\w]", "", w))) for w in words]
+            s = sum(weights); remaining = total_cs
+            parts = []
+            for idx, w in enumerate(words):
+                d = remaining if idx == len(words)-1 else max(1, round(total_cs*weights[idx]/s))
+                remaining -= d
+                parts.append(f"{{\\k{d}}}{w}")
+            text = " ".join(parts)
+        else:
+            text = f"{{\\kf{total_cs}}}{text}"
+
+    return f"Dialogue: 0,{start},{end},Default,,0000,0000,0000,,{text}"
+
+def ass_header(font: str, size: int, bold: int, primary: str, secondary: str,
                back: str, align: int, margin_v: int) -> str:
-    # bold nel Worker: -1=TRUE, 0=FALSE
     return (
         "[Script Info]\n"
-        "; generated by GAIN (Worker parity)\n"
+        "; generated by GAIN\n"
         "PlayResX: 1080\n"
         "PlayResY: 1920\n"
         "ScaledBorderAndShadow: yes\n"
         "WrapStyle: 2\n\n"
         "[V4+ Styles]\n"
-        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, "
-        "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
-        "Alignment, MarginL, MarginR, MarginV, Encoding\n"
-        f"Style: Default,{font},{size},{primary},{secondary},&H00000000,{back},{bold_flag},0,0,0,100,100,0,0,3,0,0,{align},6,6,{margin_v},1\n"
-        "[Events]\n"
-        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
+        f"Style: Default,{font},{size},{primary},{secondary},&H00000000,{back},{-1 if bold==1 else 0},0,0,0,100,100,0,0,3,0,0,{align},6,6,{margin_v},1"
     )
 
-def ass_dialogue(start_ms: int, end_ms: int, text: str) -> str:
-    s = _ms_to_ass(start_ms)
-    e = _ms_to_ass(end_ms)
-    # niente ritorni riga: il Worker li rimuove
-    text = text.replace("\\N", " ").replace("\n", " ")
-    return f"Dialogue: 0,{s},{e},Default,,0000,0000,0000,,{text}\n"
-
-def vtt_to_ass_worker_style(vtt_text: str, karaoke_mode: str,
-                            font: str, size: int, bold: int,
-                            primary_hex: str, secondary_hex: str,
-                            back_alpha: int, align: int, margin_v: int) -> str:
-    cues = vtt_parse(vtt_text)
-
-    primary   = hex_to_ass(primary_hex or "#FFFFFF")
-    secondary = hex_to_ass(secondary_hex or "#B3B3B3")
-    back      = ass_with_alpha("#000000", back_alpha)
-
-    header = ass_header(font, size, (-1 if str(bold) == "1" else 0), primary, secondary, back, align, margin_v)
-
-    out = [header]
-    for cue in cues:
-        start, end, raw_text = cue["start"], cue["end"], cue["text"]
-        total_cs = max(1, round((end - start) / 10))  # centisecondi
-        text = raw_text
-
-        if karaoke_mode and karaoke_mode.lower() != "off":
-            words = [w for w in re.split(r"\s+", raw_text) if w]
-            if karaoke_mode.lower() == "word" and len(words) > 0:
-                # pesi = numero di “caratteri alfanumerici” per parola (come il Worker)
-                weights = [max(1, sum(1 for ch in w if _is_alnum(ch))) for w in words]
-                ssum = sum(weights)
-                remaining = total_cs
-                parts = []
-                for idx, w in enumerate(words):
-                    d = remaining if idx == len(words) - 1 else max(1, round(total_cs * weights[idx] / max(1, ssum)))
-                    remaining -= d
-                    parts.append(rf"{{\k{d}}}{w}")
-                text = " ".join(parts)
-            else:
-                # karaoke lineare sull'intera riga
-                text = rf"{{\kf{total_cs}}}{raw_text}"
-
-        out.append(ass_dialogue(start, end, text))
-
-    return "".join(out)
-
-# -------------------- Health --------------------
+# -------------- health ---------------
 @app.get("/ping")
 def ping():
     return {"ok": True}
@@ -186,74 +134,91 @@ def ping():
 @app.get("/")
 def root():
     return JSONResponse({
-        "service": "GAIN ffmpeg burn (Worker parity)",
-        "endpoints": ["/ping", "/burn", "/burn-ass"],
-        "howto": "/burn?video_url=...&vtt_url=...&karaoke=word&font=Inter&size=12&bold=1&primary=%23FFFFFF&back_alpha=70&align=2&margin_v=20",
+        "service": "GAIN ffmpeg burn (VTT->ASS)",
+        "endpoints": ["/ping", "/burn"],
+        "params_burn": [
+            "video_url", "vtt_url",
+            "font=Inter", "size=18", "bold=1",
+            "primary=#FFFFFF", "secondary=#B3B3B3",
+            "back_alpha=70", "align=2", "margin_v=180",
+            "karaoke=word|line|off", "crf=18", "preset=veryfast",
+            "force_style=<optional>"
+        ]
     })
 
-# -------------------- Endpoint UNICO --------------------
+# -------------- main -----------------
 @app.get("/burn")
-async def burn(
-    video_url: str = Query(..., description="URL MP4/MOV accessibile"),
-    # usa UNO dei due:
-    ass_url: str | None = Query(None, description="Se hai già un .ASS pronto (dal Worker)"),
-    vtt_url: str | None = Query(None, description="Se hai un VTT HeyGen e vuoi generare l'.ASS qui"),
-    # parametri stile (parità con il tuo Worker)
-    font: str = Query("Inter"),
-    size: int = Query(12),
-    bold: int = Query(1, description="-1=TRUE/0=FALSE in ASS; qui 1=TRUE, 0=FALSE"),
-    primary: str = Query("#FFFFFF"),
-    secondary: str = Query("#B3B3B3"),
-    back_alpha: int = Query(70, ge=0, le=100, description="0 opaco, 100 trasparente"),
-    align: int = Query(2, description="2 = bottom-center"),
-    margin_v: int = Query(20),
-    karaoke: str = Query("word", description="word | line | off"),
-    # encoder
-    crf: int = 18,
-    preset: str = "veryfast",
-    force_style: str | None = None
+def burn(
+    video_url: str = Query(..., description="URL MP4/MOV di input"),
+    vtt_url:   str = Query(..., description="URL .vtt sorgente"),
+
+    # stile (default “Instagram friendly”)
+    font: str       = Query("Inter"),
+    size: int       = Query(18, ge=8, le=64),
+    bold: int       = Query(1),  # 1=bold
+    primary: str    = Query("#FFFFFF"),
+    secondary: str  = Query("#B3B3B3"),
+    back_alpha: int = Query(70, ge=0, le=100),
+    align: int      = Query(2),   # 2 = bottom center
+    margin_v: int   = Query(180),
+    karaoke: str    = Query("word"),  # word|line|off
+
+    # encoding
+    crf: int        = Query(18, ge=0, le=40),
+    preset: str     = Query("veryfast"),
+    force_style: str | None = Query(None, description="override stile ASS (opzionale)")
 ):
-    if not ass_url and not vtt_url:
-        raise HTTPException(status_code=422, detail="Passa 'ass_url' oppure 'vtt_url'.")
+    """
+    Scarica video + VTT, genera .ASS (karaoke) e fa burn-in tramite libass.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        in_mp4  = os.path.join(tmpdir, "in.mp4")
+        in_ass  = os.path.join(tmpdir, "subs.ass")
+        out_mp4 = os.path.join(tmpdir, "out.mp4")
+        fontsdir = "/usr/share/fonts/truetype"  # font Noto presenti nell'immagine
 
-    with tempfile.TemporaryDirectory() as tmp:
-        in_mp4  = os.path.join(tmp, "in.mp4")
-        in_ass  = os.path.join(tmp, "subs.ass")
-        out_mp4 = os.path.join(tmp, "out.mp4")
+        # 1) download input
+        download_to(in_mp4, video_url)
+        try:
+            vtt_text = urllib.request.urlopen(vtt_url).read().decode("utf-8", errors="ignore")
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Download VTT failed: {e}")
 
-        # 1) video
-        await http_get_file(video_url, in_mp4)
+        # 2) VTT -> ASS
+        cues = parse_vtt(vtt_text)
+        ev = "\n".join(to_ass_dialogue(c, karaoke) for c in cues)
 
-        # 2) sottotitoli
-        if ass_url:
-            await http_get_file(ass_url, in_ass)
-        else:
-            vtt_text = await http_get_text(vtt_url)
-            ass_text = vtt_to_ass_worker_style(
-                vtt_text=vtt_text,
-                karaoke_mode=karaoke,
-                font=font, size=size, bold=bold,
-                primary_hex=primary, secondary_hex=secondary,
-                back_alpha=back_alpha, align=align, margin_v=margin_v
-            )
-            with open(in_ass, "w", encoding="utf-8") as f:
-                f.write(ass_text)
+        back = ass_with_alpha("#000000", back_alpha)
+        ass = (
+            ass_header(font, size, bold, hex_to_ass(primary), hex_to_ass(secondary),
+                       back, align, margin_v)
+            + "\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+            + ev
+        )
+        with open(in_ass, "w", encoding="utf-8") as f:
+            f.write(ass)
 
-        # 3) ffmpeg burn-in (libass)
-        ass_path  = esc_for_subtitles(in_ass)
-        fonts_dir = esc_for_subtitles(FONTS_DIR)
-        vf = f"subtitles='{ass_path}':fontsdir='{fonts_dir}'"
+        # 3) filtro FFmpeg – CORRETTO: text_shaping=1 (non 'shaping=complex')
+        safe_path = escape_for_ffmpeg_path(in_ass)
+        vf = f"subtitles='{safe_path}':fontsdir='{fontsdir}':text_shaping=1"
         if force_style and force_style.strip():
             fs = force_style.replace("\\", "\\\\").replace("'", "\\'")
             vf += f":force_style='{fs}'"
 
+        # 4) ffmpeg
         cmd = [
-            FFMPEG_BIN, "-y", "-i", in_mp4,
+            FFMPEG_BIN, "-y",
+            "-i", in_mp4,
             "-vf", vf,
-            "-c:v", "libx264", "-crf", str(crf), "-preset", preset,
-            "-pix_fmt", "yuv420p", "-c:a", "copy", "-movflags", "+faststart",
-            out_mp4,
+            "-c:v", "libx264",
+            "-crf", str(crf),
+            "-preset", preset,
+            "-pix_fmt", "yuv420p",
+            "-c:a", "copy",
+            "-movflags", "+faststart",
+            out_mp4
         ]
+
         try:
             subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         except subprocess.CalledProcessError as e:
@@ -261,15 +226,3 @@ async def burn(
             raise HTTPException(status_code=500, detail=f"FFmpeg error:\n{err}")
 
         return FileResponse(out_mp4, media_type="video/mp4", filename="gain-burned.mp4")
-
-# -------------------- Compat: solo ASS --------------------
-@app.get("/burn-ass")
-async def burn_ass_compat(
-    video_url: str = Query(...),
-    ass_url: str   = Query(...),
-    crf: int = 18,
-    preset: str = "veryfast",
-    force_style: str | None = None
-):
-    return await burn(video_url=video_url, ass_url=ass_url, vtt_url=None,
-                      crf=crf, preset=preset, force_style=force_style)
