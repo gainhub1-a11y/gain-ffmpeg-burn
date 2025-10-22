@@ -1,132 +1,275 @@
-# app.py — GAIN FFmpeg burn-in (.ASS karaoke)
+# app.py — GAIN: VTT -> ASS (karaoke) con lo stesso stile del tuo Worker + burn-in FFmpeg
 import os
+import re
 import tempfile
+import httpx
 import subprocess
-import time
-import urllib.request
-from urllib.error import HTTPError, URLError
+from datetime import timedelta
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, JSONResponse
 
 app = FastAPI()
 
 FFMPEG_BIN = os.environ.get("FFMPEG_BIN", "ffmpeg")
+FONTS_DIR  = os.environ.get("FONTS_DIR", "/usr/share/fonts/truetype")
 
-# ---------- util ----------
-def download_to(path: str, url: str, timeout: int = 300, tries: int = 3):
-    """
-    Scarica url -> path usando header 'browser-like', streaming e retry.
-    Ritorna HTTP 400 con il dettaglio reale se il server remoto fallisce.
-    """
-    last_err = None
-    for attempt in range(1, tries + 1):
-        try:
-            req = urllib.request.Request(
-                url,
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                                  "(KHTML, like Gecko) Chrome/125.0 Safari/537.36",
-                    "Accept": "*/*",
-                    "Connection": "close",
-                }
-            )
-            with urllib.request.urlopen(req, timeout=timeout) as resp, open(path, "wb") as f:
-                while True:
-                    chunk = resp.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    f.write(chunk)
-            return
-        except HTTPError as e:
-            try:
-                body = e.read(4096).decode("utf-8", errors="ignore")
-            except Exception:
-                body = ""
-            last_err = f"HTTP {e.code}: {e.reason} {body[:300]}"
-        except URLError as e:
-            last_err = f"URL error: {e.reason}"
-        except Exception as e:
-            last_err = f"{type(e).__name__}: {e}"
+# -------------------- HTTP helpers --------------------
+UA = {"User-Agent": "Mozilla/5.0 (GAIN/ffmpeg-burn)", "Accept": "*/*"}
 
-        if attempt < tries:
-            time.sleep(1.5 * attempt)
+async def http_get_text(url: str) -> str:
+    async with httpx.AsyncClient(follow_redirects=True, timeout=120.0) as client:
+        r = await client.get(url, headers=UA)
+        if r.status_code >= 400:
+            raise HTTPException(status_code=400,
+                                detail=f"Download failed: HTTP {r.status_code}: {r.text[:400]}")
+        return r.text
 
-    raise HTTPException(status_code=400, detail=f"Download failed: {last_err}")
+async def http_get_file(url: str, path: str):
+    async with httpx.AsyncClient(follow_redirects=True, timeout=None) as client:
+        r = await client.get(url, headers=UA)
+        if r.status_code >= 400:
+            raise HTTPException(status_code=400,
+                                detail=f"Download failed: HTTP {r.status_code}: {r.text[:400]}")
+        with open(path, "wb") as f:
+            for chunk in r.iter_bytes():
+                f.write(chunk)
 
-def escape_for_ffmpeg_path(p: str) -> str:
-    """
-    Escapa il percorso file per il filtro FFmpeg `subtitles=`.
-    Regole minime: \  '  :  (i due punti rompono il filtergraph)
-    """
-    s = p.replace("\\", "\\\\")
-    s = s.replace("'", "\\'")
-    s = s.replace(":", "\\:")
-    return s
+def esc_for_subtitles(p: str) -> str:
+    # escaping minimo per il filtro subtitles=
+    return p.replace("\\", "\\\\").replace("'", "\\'").replace(":", "\\:")
 
-# ---------- health ----------
+# -------------------- VTT parsing (come il Worker) --------------------
+def vtt_parse(txt: str):
+    lines = txt.replace("\r", "").split("\n")
+    cues = []
+    i = 0
+    while i < len(lines):
+        ln = lines[i]
+        if not ln or re.match(r"^[A-Za-z-]+:", ln):  # header/comment
+            i += 1
+            continue
+        if "-->" not in ln:
+            i += 1
+            continue
+        m = re.search(r"(\d+:\d{2}:\d{2}\.\d{3}|\d{1,2}:\d{2}\.\d{3})\s*-->\s*(\d+:\d{2}:\d{2}\.\d{3}|\d{1,2}:\d{2}\.\d{3})", ln)
+        if not m:
+            i += 1
+            continue
+        start = _to_ms(m.group(1))
+        end   = _to_ms(m.group(2))
+        i += 1
+        text_lines = []
+        while i < len(lines) and lines[i]:
+            text_lines.append(lines[i])
+            i += 1
+        text = " ".join(text_lines)
+        text = re.sub(r"</?[^>]+>", "", text)   # remove HTML
+        text = re.sub(r"\s+", " ", text).strip()
+        if end > start and text:
+            cues.append({"start": start, "end": end, "text": text})
+        i += 1
+    return cues
+
+def _to_ms(ts: str) -> int:
+    # mm:ss.mmm  OR  hh:mm:ss.mmm
+    parts = ts.split(":")
+    if len(parts) == 2:
+        m, s = parts
+        sec, ms = s.split(".")
+        return int(m) * 60000 + int(sec) * 1000 + int(ms)
+    else:
+        h, m, s = parts
+        sec, ms = s.split(".")
+        return int(h) * 3600000 + int(m) * 60000 + int(sec) * 1000 + int(ms)
+
+def _ms_to_ass(ms: int) -> str:
+    cs = (ms // 10) % 100
+    s  = (ms // 1000) % 60
+    m  = (ms // 60000) % 60
+    h  = (ms // 3600000)
+    return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
+
+def _is_alnum(c: str) -> bool:
+    # conta lettere/numeri Unicode (approssimazione robusta)
+    return c.isalnum()
+
+# -------------------- Colori come il Worker --------------------
+def hex_to_ass(hex_color: str) -> str:
+    # "#RRGGBB" -> "&H00BBGGRR"
+    if not hex_color:
+        return "&H00FFFFFF"
+    m = re.match(r"^#?([0-9a-fA-F]{6})$", hex_color)
+    if not m:
+        return "&H00FFFFFF"
+    rr, gg, bb = m.group(1)[0:2], m.group(1)[2:4], m.group(1)[4:6]
+    return f"&H00{bb.upper()}{gg.upper()}{rr.upper()}"
+
+def ass_with_alpha(hex_color: str, alpha_pct: int) -> str:
+    a = max(0, min(100, alpha_pct))
+    aa = f"{round(255 * a / 100):02X}"  # 0=opaco, 100=trasparente
+    m = re.match(r"^#?([0-9a-fA-F]{6})$", hex_color or "") or re.match(r"$", "")
+    rgb = (m.group(1) if m else "000000").upper().ljust(6, "0")
+    rr, gg, bb = rgb[0:2], rgb[2:4], rgb[4:6]
+    return f"&H{aa}{bb}{gg}{rr}"
+
+# -------------------- ASS header identico al Worker --------------------
+def ass_header(font: str, size: int, bold_flag: int, primary: str, secondary: str,
+               back: str, align: int, margin_v: int) -> str:
+    # bold nel Worker: -1=TRUE, 0=FALSE
+    return (
+        "[Script Info]\n"
+        "; generated by GAIN (Worker parity)\n"
+        "PlayResX: 1080\n"
+        "PlayResY: 1920\n"
+        "ScaledBorderAndShadow: yes\n"
+        "WrapStyle: 2\n\n"
+        "[V4+ Styles]\n"
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, "
+        "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
+        "Alignment, MarginL, MarginR, MarginV, Encoding\n"
+        f"Style: Default,{font},{size},{primary},{secondary},&H00000000,{back},{bold_flag},0,0,0,100,100,0,0,3,0,0,{align},6,6,{margin_v},1\n"
+        "[Events]\n"
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+    )
+
+def ass_dialogue(start_ms: int, end_ms: int, text: str) -> str:
+    s = _ms_to_ass(start_ms)
+    e = _ms_to_ass(end_ms)
+    # niente ritorni riga: il Worker li rimuove
+    text = text.replace("\\N", " ").replace("\n", " ")
+    return f"Dialogue: 0,{s},{e},Default,,0000,0000,0000,,{text}\n"
+
+def vtt_to_ass_worker_style(vtt_text: str, karaoke_mode: str,
+                            font: str, size: int, bold: int,
+                            primary_hex: str, secondary_hex: str,
+                            back_alpha: int, align: int, margin_v: int) -> str:
+    cues = vtt_parse(vtt_text)
+
+    primary   = hex_to_ass(primary_hex or "#FFFFFF")
+    secondary = hex_to_ass(secondary_hex or "#B3B3B3")
+    back      = ass_with_alpha("#000000", back_alpha)
+
+    header = ass_header(font, size, (-1 if str(bold) == "1" else 0), primary, secondary, back, align, margin_v)
+
+    out = [header]
+    for cue in cues:
+        start, end, raw_text = cue["start"], cue["end"], cue["text"]
+        total_cs = max(1, round((end - start) / 10))  # centisecondi
+        text = raw_text
+
+        if karaoke_mode and karaoke_mode.lower() != "off":
+            words = [w for w in re.split(r"\s+", raw_text) if w]
+            if karaoke_mode.lower() == "word" and len(words) > 0:
+                # pesi = numero di “caratteri alfanumerici” per parola (come il Worker)
+                weights = [max(1, sum(1 for ch in w if _is_alnum(ch))) for w in words]
+                ssum = sum(weights)
+                remaining = total_cs
+                parts = []
+                for idx, w in enumerate(words):
+                    d = remaining if idx == len(words) - 1 else max(1, round(total_cs * weights[idx] / max(1, ssum)))
+                    remaining -= d
+                    parts.append(rf"{{\k{d}}}{w}")
+                text = " ".join(parts)
+            else:
+                # karaoke lineare sull'intera riga
+                text = rf"{{\kf{total_cs}}}{raw_text}"
+
+        out.append(ass_dialogue(start, end, text))
+
+    return "".join(out)
+
+# -------------------- Health --------------------
 @app.get("/ping")
 def ping():
     return {"ok": True}
 
-# ---------- main ----------
-@app.get("/burn-ass")
-def burn_ass(
-    video_url: str = Query(..., description="URL MP4/MOV di input"),
-    ass_url: str = Query(..., description="URL .ASS (karaoke)"),
-    crf: int = Query(18, ge=0, le=40),
-    preset: str = Query("veryfast"),
-    force_style: str | None = Query(None, description="override stile ASS: es. FontName=Arial,Outline=2,MarginV=40")
+@app.get("/")
+def root():
+    return JSONResponse({
+        "service": "GAIN ffmpeg burn (Worker parity)",
+        "endpoints": ["/ping", "/burn", "/burn-ass"],
+        "howto": "/burn?video_url=...&vtt_url=...&karaoke=word&font=Inter&size=12&bold=1&primary=%23FFFFFF&back_alpha=70&align=2&margin_v=20",
+    })
+
+# -------------------- Endpoint UNICO --------------------
+@app.get("/burn")
+async def burn(
+    video_url: str = Query(..., description="URL MP4/MOV accessibile"),
+    # usa UNO dei due:
+    ass_url: str | None = Query(None, description="Se hai già un .ASS pronto (dal Worker)"),
+    vtt_url: str | None = Query(None, description="Se hai un VTT HeyGen e vuoi generare l'.ASS qui"),
+    # parametri stile (parità con il tuo Worker)
+    font: str = Query("Inter"),
+    size: int = Query(12),
+    bold: int = Query(1, description="-1=TRUE/0=FALSE in ASS; qui 1=TRUE, 0=FALSE"),
+    primary: str = Query("#FFFFFF"),
+    secondary: str = Query("#B3B3B3"),
+    back_alpha: int = Query(70, ge=0, le=100, description="0 opaco, 100 trasparente"),
+    align: int = Query(2, description="2 = bottom-center"),
+    margin_v: int = Query(20),
+    karaoke: str = Query("word", description="word | line | off"),
+    # encoder
+    crf: int = 18,
+    preset: str = "veryfast",
+    force_style: str | None = None
 ):
-    """
-    Scarica video + .ass, brucia i sottotitoli con libass, restituisce MP4 ottimizzato per social.
-    """
-    with tempfile.TemporaryDirectory() as tmpdir:
-        in_mp4 = os.path.join(tmpdir, "in.mp4")
-        in_ass = os.path.join(tmpdir, "subs.ass")
-        out_mp4 = os.path.join(tmpdir, "out.mp4")
-        fontsdir = "/usr/share/fonts/truetype"  # Noto è installato nel Dockerfile
+    if not ass_url and not vtt_url:
+        raise HTTPException(status_code=422, detail="Passa 'ass_url' oppure 'vtt_url'.")
 
-        # 1) download
-        download_to(in_mp4, video_url)
-        download_to(in_ass, ass_url)
+    with tempfile.TemporaryDirectory() as tmp:
+        in_mp4  = os.path.join(tmp, "in.mp4")
+        in_ass  = os.path.join(tmp, "subs.ass")
+        out_mp4 = os.path.join(tmp, "out.mp4")
 
-        # 2) filtro FFmpeg
-        safe_path = escape_for_ffmpeg_path(in_ass)
-        vf = f"subtitles='{safe_path}':fontsdir='{fontsdir}':shaping=complex"
+        # 1) video
+        await http_get_file(video_url, in_mp4)
+
+        # 2) sottotitoli
+        if ass_url:
+            await http_get_file(ass_url, in_ass)
+        else:
+            vtt_text = await http_get_text(vtt_url)
+            ass_text = vtt_to_ass_worker_style(
+                vtt_text=vtt_text,
+                karaoke_mode=karaoke,
+                font=font, size=size, bold=bold,
+                primary_hex=primary, secondary_hex=secondary,
+                back_alpha=back_alpha, align=align, margin_v=margin_v
+            )
+            with open(in_ass, "w", encoding="utf-8") as f:
+                f.write(ass_text)
+
+        # 3) ffmpeg burn-in (libass)
+        ass_path  = esc_for_subtitles(in_ass)
+        fonts_dir = esc_for_subtitles(FONTS_DIR)
+        vf = f"subtitles='{ass_path}':fontsdir='{fonts_dir}'"
         if force_style and force_style.strip():
             fs = force_style.replace("\\", "\\\\").replace("'", "\\'")
             vf += f":force_style='{fs}'"
 
-        # 3) esegue ffmpeg
         cmd = [
-            FFMPEG_BIN, "-y",
-            "-i", in_mp4,
+            FFMPEG_BIN, "-y", "-i", in_mp4,
             "-vf", vf,
-            "-c:v", "libx264",
-            "-crf", str(crf),
-            "-preset", preset,
-            "-pix_fmt", "yuv420p",
-            "-c:a", "copy",
-            "-movflags", "+faststart",
+            "-c:v", "libx264", "-crf", str(crf), "-preset", preset,
+            "-pix_fmt", "yuv420p", "-c:a", "copy", "-movflags", "+faststart",
             out_mp4,
         ]
-
         try:
-            proc = subprocess.run(
-                cmd, check=True,
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE
-            )
+            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         except subprocess.CalledProcessError as e:
-            err = e.stderr.decode(errors="ignore")[-2000:]
+            err = e.stderr.decode(errors="ignore")[-4000:]
             raise HTTPException(status_code=500, detail=f"FFmpeg error:\n{err}")
 
         return FileResponse(out_mp4, media_type="video/mp4", filename="gain-burned.mp4")
 
-# ---------- root ----------
-@app.get("/")
-def root():
-    return JSONResponse({
-        "service": "GAIN ffmpeg burn-ass",
-        "endpoints": ["/ping", "/burn-ass"],
-        "params_burn_ass": ["video_url", "ass_url", "crf=18", "preset=veryfast", "force_style=<optional>"]
-    })
+# -------------------- Compat: solo ASS --------------------
+@app.get("/burn-ass")
+async def burn_ass_compat(
+    video_url: str = Query(...),
+    ass_url: str   = Query(...),
+    crf: int = 18,
+    preset: str = "veryfast",
+    force_style: str | None = None
+):
+    return await burn(video_url=video_url, ass_url=ass_url, vtt_url=None,
+                      crf=crf, preset=preset, force_style=force_style)
